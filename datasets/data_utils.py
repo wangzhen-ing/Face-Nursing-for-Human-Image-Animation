@@ -2,15 +2,11 @@ import os
 import json
 import random
 from typing import List
-import csv
-import glob
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import torch
 import torchvision.transforms as transforms
-from decord import VideoReader
 from PIL import Image
 from torch.utils.data import Dataset
 from transformers import CLIPImageProcessor
@@ -64,6 +60,15 @@ def mask_to_bbox(mask_path):
     xmin, xmax = np.where(cols)[0][[0, -1]]
     return xmin, ymin, xmax, ymax
 
+def bbox_to_mask(bbox, H, W):
+    image = np.zeros((H, W), dtype=np.uint8)
+    bbox = [int(x) for x in bbox]
+    x_min, y_min, x_max, y_max = bbox
+    
+    image[y_min: y_max, x_min: x_max] = 255
+    return Image.fromarray(image)
+    
+
 def mask_to_bkgd(img_path, mask_path):
     img = Image.open(img_path)
     img_array = np.array(img)
@@ -74,3 +79,44 @@ def mask_to_bkgd(img_path, mask_path):
     img_array = np.where(mask_array > 0, img_array, 0)
     return Image.fromarray(img_array)
     
+def mask_to_square_bbox(mask_path):
+    bounding_box_int = mask_to_bbox(mask_path)
+    # FIXME(ZSH): There should be a more elegant solution ...
+    bbox_width = bounding_box_int[2] - bounding_box_int[0]
+    bbox_height = bounding_box_int[3] - bounding_box_int[1]
+
+    # Find the maximum dimension
+    square_side = max(bbox_width, bbox_height)
+
+    # Calculate the new bounding box, centered around the original center
+    center_x = bounding_box_int[0] + bbox_width // 2
+    center_y = bounding_box_int[1] + bbox_height // 2
+
+    # New coordinates
+    x_min_square = center_x - square_side // 2
+    x_max_square = center_x + square_side // 2
+    y_min_square = center_y - square_side // 2
+    y_max_square = center_y + square_side // 2
+
+    # If the new coordinates go out of image boundaries, we shift them back into place
+    image_array = np.array(Image.open(mask_path))
+    x_min_square = max(x_min_square, 0)
+    y_min_square = max(y_min_square, 0)
+    x_max_square = min(x_max_square, image_array.shape[1])
+    y_max_square = min(y_max_square, image_array.shape[0])
+
+    # Ensure the square doesn't go out of the image bounds
+    if x_min_square < 0:
+        x_min_square = 0
+        x_max_square = square_side
+    if y_min_square < 0:
+        y_min_square = 0
+        y_max_square = square_side
+    if x_max_square > image_array.shape[1]:
+        x_max_square = image_array.shape[1]
+        x_min_square = image_array.shape[1] - square_side
+    if y_max_square > image_array.shape[0]:
+        y_max_square = image_array.shape[0]
+        y_min_square = image_array.shape[0] - square_side
+        
+    return x_min_square, y_min_square, x_max_square, y_max_square

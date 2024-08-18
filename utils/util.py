@@ -4,10 +4,11 @@ import shutil
 import sys
 from pathlib import Path
 
-import av
 import numpy as np
 import torch
 import torchvision
+import torch.nn.functional as F
+
 from einops import rearrange
 from PIL import Image
 
@@ -64,4 +65,6 @@ def compute_snr(noise_scheduler, timesteps):
     # Compute SNR.
     snr = (alpha / sigma) ** 2
     return snr
-            
+
+def is_torch2_available():
+    return hasattr(F, "scaled_dot_product_attention")
