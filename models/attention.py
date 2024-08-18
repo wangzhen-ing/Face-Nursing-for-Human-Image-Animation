@@ -5,6 +5,8 @@ from typing import Any, Dict, Optional
 import torch
 from diffusers.models.attention import AdaLayerNorm, Attention, FeedForward
 from diffusers.models.embeddings import SinusoidalPositionalEmbedding
+from models.attention_processor import LatentAttnProcessor, LayoutAttention
+from models.hie_fuser import SAC
 from einops import rearrange
 from torch import nn
 
@@ -62,6 +64,8 @@ class BasicTransformerBlock(nn.Module):
         norm_eps: float = 1e-5,
         final_dropout: bool = False,
         attention_type: str = "default",
+        use_latent_attention=True,
+        num_hie_latent=None,
         positional_embeddings: Optional[str] = None,
         num_positional_embeddings: Optional[int] = None,
     ):
@@ -184,6 +188,7 @@ class BasicTransformerBlock(nn.Module):
         timestep: Optional[torch.LongTensor] = None,
         cross_attention_kwargs: Dict[str, Any] = None,
         class_labels: Optional[torch.LongTensor] = None,
+        ref_idx=None,
     ) -> torch.FloatTensor:
         # Notice that normalization is always applied before the real computation in the following blocks.
         # 0. Self-Attention
@@ -310,6 +315,8 @@ class TemporalBasicTransformerBlock(nn.Module):
         upcast_attention: bool = False,
         unet_use_cross_frame_attention=None,
         unet_use_temporal_attention=None,
+        use_latent_attention=False,
+        num_hie_latent=None,
     ):
         super().__init__()
         self.only_cross_attention = only_cross_attention
@@ -355,6 +362,65 @@ class TemporalBasicTransformerBlock(nn.Module):
         else:
             self.norm2 = None
 
+            
+        if use_latent_attention:
+            self.attn_latent = nn.ModuleList()
+            self.norm_latent = nn.ModuleList([AdaLayerNorm(dim, num_embeds_ada_norm)
+                if self.use_ada_layer_norm
+                else nn.LayerNorm(dim)])
+            for _ in range(num_hie_latent):
+                self.attn_latent.append(
+                    Attention(
+                    query_dim=dim,
+                    cross_attention_dim=dim,
+                    heads=num_attention_heads,
+                    dim_head=attention_head_dim,
+                    dropout=dropout,
+                    # bias=attention_bias,
+                    # upcast_attention=upcast_attention,
+                )
+                )
+                self.norm_latent.append(
+                    AdaLayerNorm(dim, num_embeds_ada_norm)
+                    if self.use_ada_layer_norm
+                    else nn.LayerNorm(dim)
+                )
+            
+            self.attn_cross_latent = Attention(
+                query_dim=dim,
+                cross_attention_dim=cross_attention_dim,
+                heads=num_attention_heads,
+                dim_head=attention_head_dim,
+                dropout=dropout,
+                # bias=attention_bias,
+                # upcast_attention=upcast_attention,
+            )
+            
+            # self.attn_cross_latent = nn.ModuleList()
+            # for _ in range(num_hie_latent):
+            #     self.attn_cross_latent.append(
+            #         Attention(
+            #         query_dim=dim,
+            #         cross_attention_dim=cross_attention_dim,
+            #         heads=num_attention_heads,
+            #         dim_head=attention_head_dim,
+            #         dropout=dropout,
+            #         # bias=attention_bias,
+            #         # upcast_attention=upcast_attention,
+            #     )
+            #     )
+
+                
+            self.la = LayoutAttention(query_dim=dim)
+            self.sac = SAC(C=dim)
+            
+        else:
+            self.attn_latent = None
+            self.attn_cross_latent = None
+            self.norm_latent = None
+            self.la=None
+            self.sac=None
+
         # Feed-forward
         self.ff = FeedForward(dim, dropout=dropout, activation_fn=activation_fn)
         self.norm3 = nn.LayerNorm(dim)
@@ -385,6 +451,13 @@ class TemporalBasicTransformerBlock(nn.Module):
         timestep=None,
         attention_mask=None,
         video_length=None,
+        cross_attention_kwargs=None,
+        ref_idx=None,
+        write_latent=True,
+        do_latent_attention=False,
+        ip_tokens=None,
+        latent_attn_masks=None,
+        do_infer=False,
     ):
         norm_hidden_states = (
             self.norm1(hidden_states, timestep)
@@ -403,7 +476,7 @@ class TemporalBasicTransformerBlock(nn.Module):
             )
         else:
             hidden_states = (
-                self.attn1(norm_hidden_states, attention_mask=attention_mask)
+                self.attn1(norm_hidden_states, attention_mask=attention_mask,)
                 + hidden_states
             )
 
@@ -419,9 +492,24 @@ class TemporalBasicTransformerBlock(nn.Module):
                     norm_hidden_states,
                     encoder_hidden_states=encoder_hidden_states,
                     attention_mask=attention_mask,
+                    cross_attention_kwargs=cross_attention_kwargs
                 )
                 + hidden_states
             )
+        
+        # if self.attn_latent is not None:
+        #     norm_hidden_states = (
+        #         self.norm_latent(hidden_states, timestep)
+        #         if self.use_ada_layer_norm
+        #         else self.norm_latent(hidden_states)
+        #     )
+        #     hidden_states = (
+        #         self.attn_latent(
+        #             norm_hidden_states,
+        #             encoder_hidden_states=latent_hidden_states,
+        #             attention_mask=attention_mask,
+        #         )
+        #     )
 
         # Feed-forward
         hidden_states = self.ff(self.norm3(hidden_states)) + hidden_states

@@ -16,8 +16,10 @@ from diffusers.models.modeling_utils import ModelMixin
 from diffusers.utils import SAFETENSORS_WEIGHTS_NAME, WEIGHTS_NAME, BaseOutput, logging
 from safetensors.torch import load_file
 
-from .resnet import InflatedConv3d, InflatedGroupNorm
-from .unet_3d_blocks import UNetMidBlock3DCrossAttn, get_down_block, get_up_block
+from .resnet import InflatedConv3d, InflatedGroupNorm, ResnetBlock3D, Upsample3D
+from .unet_3d_blocks import UNetMidBlock3DCrossAttn, get_down_block, get_up_block, CrossAttnUpBlock3D
+from .transformer_3d import Transformer3DModel
+from .motion_module import get_motion_module
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -26,6 +28,9 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 class UNet3DConditionOutput(BaseOutput):
     sample: torch.FloatTensor
 
+@dataclass
+class UNet3DFaceOutput(BaseOutput):
+    sample: Tuple[torch.FloatTensor]
 
 class UNet3DConditionModel(ModelMixin, ConfigMixin):
     _supports_gradient_checkpointing = True
@@ -78,6 +83,9 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         motion_module_kwargs={},
         unet_use_cross_frame_attention=None,
         unet_use_temporal_attention=None,
+        unet_use_additional_upsample=False,
+        use_latent_attention=False,
+        num_hie_latent=None,
     ):
         super().__init__()
 
@@ -149,6 +157,8 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
                 and (not motion_module_decoder_only),
                 motion_module_type=motion_module_type,
                 motion_module_kwargs=motion_module_kwargs,
+                use_latent_attention=use_latent_attention,
+                num_hie_latent=num_hie_latent,
             )
             self.down_blocks.append(down_block)
 
@@ -173,6 +183,8 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
                 use_motion_module=use_motion_module and motion_module_mid_block,
                 motion_module_type=motion_module_type,
                 motion_module_kwargs=motion_module_kwargs,
+                use_latent_attention=use_latent_attention,
+                num_hie_latent=num_hie_latent,                
             )
         else:
             raise ValueError(f"unknown mid_block_type : {mid_block_type}")
@@ -227,9 +239,40 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
                 and (res in motion_module_resolutions),
                 motion_module_type=motion_module_type,
                 motion_module_kwargs=motion_module_kwargs,
+                use_latent_attention=use_latent_attention,
+                num_hie_latent=num_hie_latent,                
             )
             self.up_blocks.append(up_block)
             prev_output_channel = output_channel
+
+        # face upsample module
+        self.unet_use_additional_upsample = unet_use_additional_upsample
+        if unet_use_additional_upsample:
+            self.face_up_block = CrossAttnUpBlock3DWores(
+                num_layers=layers_per_block + 1,
+                in_channels=reversed_block_out_channels[-1],
+                out_channels=reversed_block_out_channels[-1],
+                prev_output_channel=reversed_block_out_channels[-1],
+                temb_channels=time_embed_dim,
+                add_upsample=True,
+                resnet_eps=norm_eps,
+                resnet_act_fn=act_fn,
+                resnet_groups=norm_num_groups,
+                cross_attention_dim=cross_attention_dim,
+                attn_num_head_channels=reversed_attention_head_dim[-1],
+                dual_cross_attention=dual_cross_attention,
+                use_linear_projection=use_linear_projection,
+                only_cross_attention=only_cross_attention[-1],
+                upcast_attention=upcast_attention,
+                resnet_time_scale_shift=resnet_time_scale_shift,
+                unet_use_cross_frame_attention=unet_use_cross_frame_attention,
+                unet_use_temporal_attention=unet_use_temporal_attention,
+                use_inflated_groupnorm=use_inflated_groupnorm,
+                use_motion_module=use_motion_module
+                and (res in motion_module_resolutions),
+                motion_module_type=motion_module_type,
+                motion_module_kwargs=motion_module_kwargs,         
+            )
 
         # out
         if use_inflated_groupnorm:
@@ -407,6 +450,12 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         mid_block_additional_residual: Optional[torch.Tensor] = None,
         return_dict: bool = True,
         ref_idx=None,
+        additional_upsample=False,
+        write_latent=True,
+        do_latent_attention=False,
+        ip_tokens=None,
+        latent_attn_masks=None,
+        do_infer=False,        
     ) -> Union[UNet3DConditionOutput, Tuple]:
         r"""
         Args:
@@ -499,6 +548,11 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
                     attention_mask=attention_mask,
                     cross_attention_kwargs=cross_attention_kwargs,
                     ref_idx=ref_idx,
+                    write_latent=write_latent,
+                    do_latent_attention=do_latent_attention,
+                    ip_tokens=ip_tokens,
+                    latent_attn_masks=latent_attn_masks,
+                    do_infer=do_infer,
                 )
             else:
                 sample, res_samples = downsample_block(
@@ -529,7 +583,12 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
             encoder_hidden_states=encoder_hidden_states,
             attention_mask=attention_mask,
             cross_attention_kwargs=cross_attention_kwargs,
-            ref_idx=ref_idx
+            ref_idx=ref_idx,
+            write_latent=write_latent,
+            do_latent_attention=do_latent_attention,
+            ip_tokens=ip_tokens,
+            latent_attn_masks=latent_attn_masks,
+            do_infer=do_infer,          
         )
 
         if mid_block_additional_residual is not None:
@@ -562,6 +621,11 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
                     attention_mask=attention_mask,
                     cross_attention_kwargs=cross_attention_kwargs,
                     ref_idx=ref_idx,
+                    write_latent=write_latent,
+                    do_latent_attention=do_latent_attention,
+                    ip_tokens=ip_tokens,
+                    latent_attn_masks=latent_attn_masks,
+                    do_infer=do_infer,                   
                 )
             else:
                 sample = upsample_block(
@@ -573,14 +637,30 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
                 )
 
         # post-process
-        sample = self.conv_norm_out(sample)
-        sample = self.conv_act(sample)
-        sample = self.conv_out(sample)
+        output_sample = self.conv_norm_out(sample)
+        output_sample = self.conv_act(output_sample)
+        output_sample = self.conv_out(output_sample)
+
+        if additional_upsample:
+            upsampled_sample = self.face_up_block(
+                hidden_states=sample,
+                temb=emb,
+                res_hidden_states_tuple=res_samples,
+                upsample_size=upsample_size,
+                encoder_hidden_states=encoder_hidden_states,
+                ref_idx=ref_idx,
+            )
+        else:
+            if not return_dict:
+                return (output_sample, sample,)
+            return UNet3DFaceOutput(sample=(output_sample, sample,))
+
 
         if not return_dict:
-            return (sample,)
+            return (output_sample, sample, upsampled_sample,)
 
-        return UNet3DConditionOutput(sample=sample)
+        # return UNet3DConditionOutput(sample=sample)
+        return UNet3DFaceOutput(sample=(output_sample, sample, upsampled_sample,))
 
     @classmethod
     def from_pretrained_2d(
@@ -643,8 +723,11 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         if motion_module_path.exists() and motion_module_path.is_file():
             if motion_module_path.suffix.lower() in [".pth", ".pt", ".ckpt"]:
                 logger.info(f"Load motion module params from {motion_module_path}")
+                # motion_state_dict = torch.load(
+                #     motion_module_path, map_location="cpu", weights_only=True
+                # )
                 motion_state_dict = torch.load(
-                    motion_module_path, map_location="cpu", weights_only=True
+                    motion_module_path, map_location="cpu"
                 )
             elif motion_module_path.suffix.lower() == ".safetensors":
                 motion_state_dict = load_file(motion_module_path, device="cpu")
@@ -674,3 +757,162 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         logger.info(f"Loaded {sum(params) / 1e6}M-parameter motion module")
 
         return model
+
+class CrossAttnUpBlock3DWores(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        prev_output_channel: int,
+        temb_channels: int,
+        dropout: float = 0.0,
+        num_layers: int = 1,
+        resnet_eps: float = 1e-6,
+        resnet_time_scale_shift: str = "default",
+        resnet_act_fn: str = "swish",
+        resnet_groups: int = 32,
+        resnet_pre_norm: bool = True,
+        attn_num_head_channels=1,
+        cross_attention_dim=1280,
+        output_scale_factor=1.0,
+        add_upsample=True,
+        dual_cross_attention=False,
+        use_linear_projection=False,
+        only_cross_attention=False,
+        upcast_attention=False,
+        unet_use_cross_frame_attention=None,
+        unet_use_temporal_attention=None,
+        use_motion_module=None,
+        use_inflated_groupnorm=None,
+        motion_module_type=None,
+        motion_module_kwargs=None,
+    ):
+        super().__init__()
+        resnets = []
+        attentions = []
+        motion_modules = []
+
+        self.has_cross_attention = True
+        self.attn_num_head_channels = attn_num_head_channels
+
+        for i in range(num_layers):
+            resnet_in_channels = prev_output_channel if i == 0 else out_channels
+
+            resnets.append(
+                ResnetBlock3D(
+                    in_channels=resnet_in_channels,
+                    out_channels=out_channels,
+                    temb_channels=temb_channels,
+                    eps=resnet_eps,
+                    groups=resnet_groups,
+                    dropout=dropout,
+                    time_embedding_norm=resnet_time_scale_shift,
+                    non_linearity=resnet_act_fn,
+                    output_scale_factor=output_scale_factor,
+                    pre_norm=resnet_pre_norm,
+                    use_inflated_groupnorm=use_inflated_groupnorm,
+                )
+            )
+            if dual_cross_attention:
+                raise NotImplementedError
+            attentions.append(
+                Transformer3DModel(
+                    attn_num_head_channels,
+                    out_channels // attn_num_head_channels,
+                    in_channels=out_channels,
+                    num_layers=1,
+                    cross_attention_dim=cross_attention_dim,
+                    norm_num_groups=resnet_groups,
+                    use_linear_projection=use_linear_projection,
+                    only_cross_attention=only_cross_attention,
+                    upcast_attention=upcast_attention,
+                    unet_use_cross_frame_attention=unet_use_cross_frame_attention,
+                    unet_use_temporal_attention=unet_use_temporal_attention,
+                )
+            )
+            motion_modules.append(
+                get_motion_module(
+                    in_channels=out_channels,
+                    motion_module_type=motion_module_type,
+                    motion_module_kwargs=motion_module_kwargs,
+                )
+                if use_motion_module
+                else None
+            )
+
+        self.attentions = nn.ModuleList(attentions)
+        self.resnets = nn.ModuleList(resnets)
+        self.motion_modules = nn.ModuleList(motion_modules)
+
+        if add_upsample:
+            self.upsamplers = nn.ModuleList(
+                [Upsample3D(out_channels, use_conv=True, out_channels=out_channels)]
+            )
+        else:
+            self.upsamplers = None
+
+        self.gradient_checkpointing = False
+            
+    def forward(
+        self,
+        hidden_states,
+        res_hidden_states_tuple,
+        temb=None,
+        encoder_hidden_states=None,
+        upsample_size=None,
+        attention_mask=None,
+        cross_attention_kwargs=None,
+        ref_idx=None,
+    ):
+        if self.upsamplers is not None:
+            for upsampler in self.upsamplers:
+                hidden_states = upsampler(hidden_states, upsample_size)
+        assert ref_idx is None
+        for i, (resnet, attn, motion_module) in enumerate(
+            zip(self.resnets, self.attentions, self.motion_modules)
+        ):
+            if self.training and self.gradient_checkpointing:
+
+                def create_custom_forward(module, return_dict=None):
+                    def custom_forward(*inputs):
+                        if return_dict is not None:
+                            return module(*inputs, return_dict=return_dict)
+                        else:
+                            return module(*inputs)
+
+                    return custom_forward
+
+                hidden_states = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(resnet), hidden_states, temb
+                )
+                hidden_states = attn(
+                    hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                ).sample
+                if motion_module is not None:
+                    hidden_states = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(motion_module),
+                        hidden_states.requires_grad_(),
+                        temb,
+                        encoder_hidden_states,
+                    )
+
+            else:
+                hidden_states = resnet(hidden_states, temb)
+                hidden_states = attn(
+                    hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    cross_attention_kwargs=cross_attention_kwargs,
+                    ref_idx=ref_idx,
+                ).sample
+
+                # add motion module
+                hidden_states = (
+                    motion_module(
+                        hidden_states, temb, encoder_hidden_states=encoder_hidden_states
+                    )
+                    if motion_module is not None
+                    else hidden_states
+                )
+
+        return hidden_states

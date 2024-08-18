@@ -7,7 +7,9 @@ from einops import rearrange
 from models.attention import TemporalBasicTransformerBlock
 
 from .attention import BasicTransformerBlock
-
+import torch.nn.functional as F
+import math
+# NOTE(wz) face latent injection both in spatial attention and cross attention with alignment(在attention操作前对齐)
 
 def torch_dfs(model: torch.nn.Module):
     result = [model]
@@ -101,9 +103,8 @@ class ReferenceAttentionControl:
             class_labels: Optional[torch.LongTensor] = None,
             video_length=None,
             ref_idx=None,
-            write_latent=False,
+            write_latent=True,
             do_latent_attention=False,
-            ip_tokens=None,
             latent_attn_masks=None,
             do_infer=False,
         ):
@@ -158,9 +159,22 @@ class ReferenceAttentionControl:
                         )
                         for d in self.bank
                     ]
-                    modify_norm_hidden_states = torch.cat(
-                        [norm_hidden_states] + bank_fea, dim=1
-                    )
+                    if not ref_idx:
+                        modify_norm_hidden_states = torch.cat(
+                            [norm_hidden_states] + bank_fea, dim=1
+                        )
+                    else:
+                        modify_norm_hidden_states = torch.cat(
+                            [norm_hidden_states] + [bank_fea[i] for i in ref_idx], dim=1
+                        )
+                    
+                    # if write_latent:
+                    #     self.latent_bank.append(norm_hidden_states)
+                        
+                    # if do_latent_attention:
+                    #     modify_norm_hidden_states = torch.cat([modify_norm_hidden_states] + self.latent_bank, dim=1)
+                    #     self.latent_bank.clear()
+                    
                     hidden_states_uc = (
                         self.attn1(
                             norm_hidden_states,
@@ -169,6 +183,45 @@ class ReferenceAttentionControl:
                         )
                         + hidden_states
                     )
+                    
+                    if write_latent:
+                        self.latent_bank.append(norm_hidden_states)        
+                                    
+                    if do_latent_attention:
+                        latent_hidden_states_uc = (
+                            self.attn_latent[0](
+                                norm_hidden_states,
+                                encoder_hidden_states=torch.cat(
+                                    [norm_hidden_states, self.latent_bank[0]], dim=1 
+                                ),
+                                attention_mask=attention_mask,
+                            ) + hidden_states
+                        )
+                        # self.latent_bank.clear()
+                        
+                        if do_classifier_free_guidance:
+                            latent_hidden_states_c = latent_hidden_states_uc.clone()
+                            _uc_mask = uc_mask.clone()
+                            if hidden_states.shape[0] != _uc_mask.shape[0]:
+                                _uc_mask = (
+                                    torch.Tensor(
+                                        [1] * (hidden_states.shape[0] // 2)
+                                        + [0] * (hidden_states.shape[0] // 2)
+                                    )
+                                    .to(device)
+                                    .bool()
+                                )
+                            latent_hidden_states_c[_uc_mask] = (
+                                self.attn_latent[0](
+                                    norm_hidden_states[_uc_mask],
+                                    encoder_hidden_states=norm_hidden_states[_uc_mask],
+                                    attention_mask=attention_mask,
+                                ) + hidden_states[_uc_mask]
+                            )
+                            latent_hidden_states = latent_hidden_states_c.clone()
+                        else:
+                            latent_hidden_states = latent_hidden_states_uc
+                    
                     if do_classifier_free_guidance:
                         hidden_states_c = hidden_states_uc.clone()
                         _uc_mask = uc_mask.clone()
@@ -192,7 +245,10 @@ class ReferenceAttentionControl:
                         hidden_states = hidden_states_c.clone()
                     else:
                         hidden_states = hidden_states_uc
-
+                        
+                    if do_latent_attention:
+                        hidden_states = hidden_states + latent_hidden_states
+                                                        
                     # self.bank.clear()
                     if self.attn2 is not None:
                         # Cross-Attention
@@ -201,6 +257,40 @@ class ReferenceAttentionControl:
                             if self.use_ada_layer_norm
                             else self.norm2(hidden_states)
                         )
+
+                        if do_latent_attention:
+                            latent_cross_hidden_states = (
+                                self.attn_cross_latent[0](
+                                    norm_hidden_states,
+                                    encoder_hidden_states=self.latent_bank[0],
+                                    attention_mask=attention_mask,
+                                ) + hidden_states
+                            )
+                            self.latent_bank.clear()
+                        
+                        # if do_classifier_free_guidance:
+                        #     latent_hidden_states_c = latent_hidden_states_uc.clone()
+                        #     _uc_mask = uc_mask.clone()
+                        #     if hidden_states.shape[0] != _uc_mask.shape[0]:
+                        #         _uc_mask = (
+                        #             torch.Tensor(
+                        #                 [1] * (hidden_states.shape[0] // 2)
+                        #                 + [0] * (hidden_states.shape[0] // 2)
+                        #             )
+                        #             .to(device)
+                        #             .bool()
+                        #         )
+                        #     latent_hidden_states_c[_uc_mask] = (
+                        #         self.attn_latent[0](
+                        #             norm_hidden_states[_uc_mask],
+                        #             encoder_hidden_states=norm_hidden_states[_uc_mask],
+                        #             attention_mask=attention_mask,
+                        #         ) + hidden_states[_uc_mask]
+                        #     )
+                        #     latent_hidden_states = latent_hidden_states_c.clone()
+                        # else:
+                        #     latent_hidden_states = latent_hidden_states_uc
+
                         hidden_states = (
                             self.attn2(
                                 norm_hidden_states,
@@ -211,6 +301,100 @@ class ReferenceAttentionControl:
                             + hidden_states
                         )
 
+                        if do_latent_attention:
+                            hidden_states = hidden_states + latent_cross_hidden_states 
+
+
+                    # if write_latent:
+                    #     self.latent_bank.append(hidden_states.clone())
+                    
+                    # if do_latent_attention:
+                    #     assert not write_latent
+                    #     if do_classifier_free_guidance and do_infer:
+                    #         hidden_states_c = hidden_states[hidden_states.shape[0] // 2:, ...]
+                    #         # hidden_states_c = hidden_states
+                    #     else:
+                    #         hidden_states_c = hidden_states
+                    #     # latent_attn_masks: b*t, hie_num, h, w
+                    #     hidden_states_c = self.norm_latent[0](hidden_states_c)
+                        
+                    #     # latent_hidden_states_lst = [self.norm_latent[0](
+                    #     #     h for h in self.latent_bank
+                    #     # )]
+                    #     # latent_hidden_states = torch.cat([hidden_states_c] + latent_hidden_states_lst, dim=1)
+                    #     # hidden_states_c = self.latent_attn[0](
+                    #     #     hidden_states_c,
+                    #     #     encoder_hidden_states=latent_hidden_states,
+                    #     #     attention_mask=attention_mask,
+                    #     # ) + hidden_states_c
+                    #     # self.latent_bank.clear()
+                        
+                    #     assert latent_attn_masks.shape[1] == len(self.latent_bank)
+                    #     # hidden_states_c = self.norm_latent(hidden_states_c)
+                    #     hierarchy_num = len(self.latent_bank)
+                    #     # hidden states: b*t, l, c                        
+                    #     # hidden_states_c = hidden_states_c.unsqueeze(1).repeat(1, hierarchy_num+1, 1, 1)
+                    #     hsize = int(math.sqrt(hidden_states_c.shape[-2]))
+                        
+                    #     B, mask_hn, mask_H, mask_W = latent_attn_masks.shape
+                    #     assert mask_hn == hierarchy_num
+
+                    #     hie_hidden_states_lst = []
+                    #     latent_attn_masks = F.interpolate(latent_attn_masks, size=(hsize, hsize), mode="bilinear")              
+                    #     for latent_idx, latent_hidden_states in enumerate(self.latent_bank): # b, hn, l, c
+                    #         # latent_hidden_states = torch.stake(self.latent_bank, dim=1)  # b, hn-1, l, c
+                    #         if do_classifier_free_guidance and do_infer:
+                    #             latent_hidden_states = latent_hidden_states[latent_hidden_states.shape[0] // 2:, ...]
+                    #         _, latent_HW, latent_C = latent_hidden_states.shape
+                            
+                    #         hie_attn_mask = latent_attn_masks[:, latent_idx, ...]
+                    #         # hie_attn_mask = F.interpolate(hie_attn_mask.unsqueeze(1), size=(hsize, hsize), mode="bilinear")
+                    #         hie_attn_mask = hie_attn_mask.reshape(B, hsize**2, 1)
+                            
+                    #         hie_hidden_states = hidden_states_c.clone()
+                    #         latent_hidden_states = self.norm_latent[latent_idx+1](latent_hidden_states)
+                    #         hie_hidden_states = self.attn_latent[latent_idx](
+                    #             hidden_states=hie_hidden_states,
+                    #             encoder_hidden_states=torch.cat([hie_hidden_states, latent_hidden_states], dim=1),
+                    #             attention_mask=attention_mask,
+                    #             # latent_attn_mask=latent_attn_masks,
+                    #         )
+
+                    #         hie_hidden_states = hie_hidden_states * hie_attn_mask
+                    #         # hie_hidden_states = hie_hidden_states + hidden_states_c * hie_attn_mask
+                    #         hie_hidden_states_lst.append(hie_hidden_states)
+                        
+                    #     self.latent_bank.clear() # clear latent bank
+                        
+                    #     # background feature
+                    #     supp_mask = torch.prod(1 - latent_attn_masks, dim=1, keepdim=False)
+                    #     supp_mask = F.interpolate(supp_mask.unsqueeze(1), size=(hsize, hsize), mode="bilinear")
+                    #     ori_supp_mask = supp_mask.clone()
+                    #     supp_mask = supp_mask.reshape(B, hsize**2, 1)
+                    #     supp_hidden_states = hidden_states_c * supp_mask                        
+                    #     # template = self.la(x=hidden_states_c, guidance_mask=torch.cat(
+                    #     #     [ori_supp_mask, latent_attn_masks], dim=1
+                    #     # ))
+                    #     template = hidden_states_c
+                        
+                    #     # hidden_states_stacked = torch.stack([supp_hidden_states] + hie_hidden_states_lst + [template], dim=1) # B, hie_num+2, l, c
+                    #     hidden_states_stacked = torch.stack([supp_hidden_states] + hie_hidden_states_lst, dim=1) # B, hie_num+2, l, c
+
+                    #     # guidance_mask = torch.cat([
+                    #     #     ori_supp_mask, latent_attn_masks, torch.ones(B, 1, hsize, hsize).to(ori_supp_mask.device),
+                    #     # ], dim=1)
+                    #     guidance_mask = torch.cat([
+                    #         ori_supp_mask, latent_attn_masks,#, torch.ones(B, 1, hsize, hsize).to(ori_supp_mask.device),
+                    #     ], dim=1)
+                                                
+                    #     hidden_states_c, sac_scale = self.sac(hidden_states_stacked, guidance_mask)
+                    #     hidden_states_c = hidden_states_c.squeeze(1)
+                    #     if do_classifier_free_guidance and do_infer:
+                    #         hidden_states = torch.cat([hidden_states[:hidden_states.shape[0] // 2], hidden_states_c], dim=0)
+                    #         # hidden_states = hidden_states_c
+                    #     else:
+                    #         hidden_states = hidden_states_c
+                        
                     # Feed-forward
                     hidden_states = self.ff(self.norm3(hidden_states)) + hidden_states
 
@@ -253,7 +437,7 @@ class ReferenceAttentionControl:
                     **cross_attention_kwargs,
                 )
                 hidden_states = attn_output + hidden_states
-
+                
             # 3. Feed-forward
             norm_hidden_states = self.norm3(hidden_states)
 
@@ -305,7 +489,8 @@ class ReferenceAttentionControl:
 
                 module.bank = []
                 module.attn_weight = float(i) / float(len(attn_modules))
-
+                module.latent_bank = []
+                
     def update(self, writer, dtype=torch.float16):
         if self.reference_attn:
             if self.fusion_blocks == "midup":
@@ -343,7 +528,7 @@ class ReferenceAttentionControl:
             )
             for r, w in zip(reader_attn_modules, writer_attn_modules):
                 r.bank = [v.clone().to(dtype) for v in w.bank]
-                # r.bank.append([v.clone().to(dtype) for v in w.bank])
+                # r.bank.append([v.clone().to(dtype) for v in bank])
                 # w.bank.clear()
 
     def clear(self):

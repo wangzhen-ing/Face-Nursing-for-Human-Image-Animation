@@ -1,4 +1,4 @@
-exp_name: 'stage1_noface'
+exp_name: 'champ_stage1_addface_no1.5_zero_V2'
 output_dir: './exp_output'
 seed: 42
 resume_from_checkpoint: ''
@@ -6,13 +6,15 @@ resume_from_checkpoint: ''
 checkpointing_steps: 2000
 save_model_epoch_interval: 20
 
+# face_loss_weight: 0.2
+
 data:
-  train_bs: 2
+  train_bs: 4
   video_folder: '/cpfs01/projects-HDD/cfff-6f3a36a0cd1e_HDD/zsy_43187/champ/datasets/archived/Processed_Local_v3' # Your data root folder
   guids: 
-    # - 'depth'
-    # - 'normal'
-    # - 'semantic_map'
+    - 'depth'
+    - 'normal'
+    - 'semantic_map'
     - 'DWpose'
   image_size: 768
   bbox_crop: false
@@ -21,9 +23,15 @@ data:
   data_parts:
     - "all"
   sample_margin: 30
+  select_face: true
+  face_folder: "/cpfs01/projects-HDD/cfff-6f3a36a0cd1e_HDD/zsy_43187/champ/workspaces/qingkun/champ_train/temp_with_face_mask"
+  face_image_size: 256
+  face_guids:
+    - "lmk_images"
 
 validation:
-  validation_steps: 1000
+  validation_steps: 500
+  aug_type: "Resize"
   ref_images:
     - validation_data/ref_images/val-1.png
     - validation_data/ref_images/037.png
@@ -33,6 +41,10 @@ validation:
     # - validation_data/ref_images/02.png
     - validation_data/ref_images/002.png
     - validation_data/ref_images/0002.png
+    - validation_data/ref_images/000001_all.png
+    - validation_data/ref_images/000002_all.png
+    - validation_data/ref_images/000003_all.png
+
   guidance_folders:
     - validation_data/guid_sequences/000_1
     - validation_data/guid_sequences/000_1
@@ -42,14 +54,33 @@ validation:
     # - validation_data/guid_sequences/009_1
     - validation_data/guid_sequences/027_0
     - validation_data/guid_sequences/085_07
-  guidance_indexes: [0, 30, 60, 90, 20, 30, 10]            
+    - validation_data/guid_sequences/01
+    - validation_data/guid_sequences/02
+    - validation_data/guid_sequences/03
+
+  region_images:
+    - validation_data/region_images/val-1.png
+    - validation_data/region_images/037.png
+    - validation_data/region_images/4.png
+    - validation_data/region_images/04.png
+    - validation_data/region_images/004.png
+    # - validation_data/region_images/02.png
+    - validation_data/region_images/002.png
+    - validation_data/region_images/0002.png
+    - validation_data/region_images/000001_all.png
+    - validation_data/region_images/000002_all.png
+    - validation_data/region_images/000003_all.png
+
+    
+                    
+  guidance_indexes: [0, 30, 60, 90, 20, 0, 30, 60, 90, 20]            
 
 solver:
   gradient_accumulation_steps: 1
   mixed_precision: 'fp16'
-  enable_xformers_memory_efficient_attention: True 
+  enable_xformers_memory_efficient_attention: False 
   gradient_checkpointing: False 
-  max_train_steps: 50000
+  max_train_steps: 60000  # 50000
   max_grad_norm: 1.0
   # lr
   learning_rate: 1.0e-5
@@ -80,6 +111,9 @@ guidance_encoder_kwargs:
 base_model_path: 'pretrained_models/stable-diffusion-v1-5'
 vae_model_path: 'pretrained_models/sd-vae-ft-mse'
 image_encoder_path: 'pretrained_models/image_encoder'
+ipadapter_path: "pretrained_models/ip-adapter-faceid-plusv2_sd15.bin"
+image_encoder_ip_path: "pretrained_models/laion_clip"
+ckpt_dir: 'pretrained_models/champ'
 
 weight_dtype: 'fp16'  # [fp16, fp32]
 uncond_ratio: 0.1

@@ -11,7 +11,6 @@ from .motion_module import get_motion_module
 from .resnet import Downsample3D, ResnetBlock3D, Upsample3D
 from .transformer_3d import Transformer3DModel
 
-
 def get_down_block(
     down_block_type,
     num_layers,
@@ -36,6 +35,8 @@ def get_down_block(
     use_motion_module=None,
     motion_module_type=None,
     motion_module_kwargs=None,
+    use_latent_attention=False,
+    num_hie_latent=None,
 ):
     down_block_type = (
         down_block_type[7:]
@@ -87,6 +88,8 @@ def get_down_block(
             use_motion_module=use_motion_module,
             motion_module_type=motion_module_type,
             motion_module_kwargs=motion_module_kwargs,
+            use_latent_attention=use_latent_attention,
+            num_hie_latent=num_hie_latent,
         )
     raise ValueError(f"{down_block_type} does not exist.")
 
@@ -115,6 +118,8 @@ def get_up_block(
     use_motion_module=None,
     motion_module_type=None,
     motion_module_kwargs=None,
+    use_latent_attention=False,
+    num_hie_latent=None,
 ):
     up_block_type = (
         up_block_type[7:] if up_block_type.startswith("UNetRes") else up_block_type
@@ -164,6 +169,8 @@ def get_up_block(
             use_motion_module=use_motion_module,
             motion_module_type=motion_module_type,
             motion_module_kwargs=motion_module_kwargs,
+            use_latent_attention=use_latent_attention,
+            num_hie_latent=num_hie_latent,
         )
     raise ValueError(f"{up_block_type} does not exist.")
 
@@ -192,6 +199,8 @@ class UNetMidBlock3DCrossAttn(nn.Module):
         use_motion_module=None,
         motion_module_type=None,
         motion_module_kwargs=None,
+        use_latent_attention=False,
+        num_hie_latent=None,
     ):
         super().__init__()
 
@@ -235,6 +244,8 @@ class UNetMidBlock3DCrossAttn(nn.Module):
                     upcast_attention=upcast_attention,
                     unet_use_cross_frame_attention=unet_use_cross_frame_attention,
                     unet_use_temporal_attention=unet_use_temporal_attention,
+                    use_latent_attention=use_latent_attention,
+                    num_hie_latent=num_hie_latent,
                 )
             )
             motion_modules.append(
@@ -272,6 +283,13 @@ class UNetMidBlock3DCrossAttn(nn.Module):
         temb=None,
         encoder_hidden_states=None,
         attention_mask=None,
+        cross_attention_kwargs=None,
+        ref_idx=None,
+        write_latent=True,
+        do_latent_attention=False,
+        ip_tokens=None,
+        latent_attn_masks=None,
+        do_infer=False,
     ):
         hidden_states = self.resnets[0](hidden_states, temb)
         for attn, resnet, motion_module in zip(
@@ -280,6 +298,13 @@ class UNetMidBlock3DCrossAttn(nn.Module):
             hidden_states = attn(
                 hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
+                cross_attention_kwargs=cross_attention_kwargs,
+                ref_idx=ref_idx,
+                write_latent=write_latent,
+                do_latent_attention=do_latent_attention,
+                ip_tokens=ip_tokens,
+                latent_attn_masks=latent_attn_masks,
+                do_infer=do_infer,                
             ).sample
             hidden_states = (
                 motion_module(
@@ -321,6 +346,8 @@ class CrossAttnDownBlock3D(nn.Module):
         use_motion_module=None,
         motion_module_type=None,
         motion_module_kwargs=None,
+        use_latent_attention=False,
+        num_hie_latent=None,
     ):
         super().__init__()
         resnets = []
@@ -362,6 +389,8 @@ class CrossAttnDownBlock3D(nn.Module):
                     upcast_attention=upcast_attention,
                     unet_use_cross_frame_attention=unet_use_cross_frame_attention,
                     unet_use_temporal_attention=unet_use_temporal_attention,
+                    use_latent_attention=use_latent_attention,
+                    num_hie_latent=num_hie_latent,
                 )
             )
             motion_modules.append(
@@ -401,6 +430,13 @@ class CrossAttnDownBlock3D(nn.Module):
         temb=None,
         encoder_hidden_states=None,
         attention_mask=None,
+        cross_attention_kwargs=None,
+        ref_idx=None,
+        write_latent=True,
+        do_latent_attention=False,
+        ip_tokens=None,
+        latent_attn_masks=None,
+        do_infer=False,
     ):
         output_states = ()
 
@@ -428,6 +464,27 @@ class CrossAttnDownBlock3D(nn.Module):
                     encoder_hidden_states,
                 )[0]
 
+                # print(hidden_states.shape, encoder_hidden_states.shape, '================222================')
+                # torch.Size([2, 320, 12, 32, 32]) torch.Size([2, 4, 768]) ================================
+                # torch.Size([2, 320, 12, 32, 32]) torch.Size([2, 4, 768]) ================================
+                # torch.Size([2, 640, 12, 16, 16]) torch.Size([2, 4, 768]) ================================
+                # torch.Size([2, 640, 12, 16, 16]) torch.Size([2, 4, 768]) ================================
+                # torch.Size([2, 1280, 12, 8, 8]) torch.Size([2, 4, 768]) ================================
+                # torch.Size([2, 1280, 12, 8, 8]) torch.Size([2, 4, 768]) ================================
+                # torch.Size([2, 320, 12, 128, 128]) torch.Size([2, 1, 768]) ================================
+                # torch.Size([2, 320, 12, 128, 128]) torch.Size([2, 1, 768]) ================================
+                # torch.Size([2, 640, 12, 64, 64]) torch.Size([2, 1, 768]) ================================
+                # torch.Size([2, 640, 12, 64, 64]) torch.Size([2, 1, 768]) ================================
+                # torch.Size([2, 1280, 12, 32, 32]) torch.Size([2, 1, 768]) ================================
+                # torch.Size([2, 1280, 12, 32, 32]) torch.Size([2, 1, 768]) ================================
+
+                # torch.Size([1, 320, 12, 128, 128]) torch.Size([1, 1, 768]) ================================
+                # torch.Size([1, 320, 12, 128, 128]) torch.Size([1, 1, 768]) ================================
+                # torch.Size([1, 640, 12, 64, 64]) torch.Size([1, 1, 768]) ================================
+                # torch.Size([1, 640, 12, 64, 64]) torch.Size([1, 1, 768]) ================================
+                # torch.Size([1, 1280, 12, 32, 32]) torch.Size([1, 1, 768]) ================================
+                # torch.Size([1, 1280, 12, 32, 32]) torch.Size([1, 1, 768]) ================================
+
                 # add motion module
                 hidden_states = (
                     motion_module(
@@ -442,6 +499,13 @@ class CrossAttnDownBlock3D(nn.Module):
                 hidden_states = attn(
                     hidden_states,
                     encoder_hidden_states=encoder_hidden_states,
+                    cross_attention_kwargs=cross_attention_kwargs,
+                    ref_idx=ref_idx,
+                    write_latent=write_latent,
+                    do_latent_attention=do_latent_attention,
+                    ip_tokens=ip_tokens,
+                    latent_attn_masks=latent_attn_masks,
+                    do_infer=do_infer,
                 ).sample
 
                 # add motion module
@@ -611,6 +675,8 @@ class CrossAttnUpBlock3D(nn.Module):
         use_inflated_groupnorm=None,
         motion_module_type=None,
         motion_module_kwargs=None,
+        use_latent_attention=False,
+        num_hie_latent=None,
     ):
         super().__init__()
         resnets = []
@@ -654,6 +720,8 @@ class CrossAttnUpBlock3D(nn.Module):
                     upcast_attention=upcast_attention,
                     unet_use_cross_frame_attention=unet_use_cross_frame_attention,
                     unet_use_temporal_attention=unet_use_temporal_attention,
+                    use_latent_attention=use_latent_attention,
+                    num_hie_latent=num_hie_latent,                    
                 )
             )
             motion_modules.append(
@@ -687,6 +755,13 @@ class CrossAttnUpBlock3D(nn.Module):
         encoder_hidden_states=None,
         upsample_size=None,
         attention_mask=None,
+        cross_attention_kwargs=None,
+        ref_idx=None,
+        write_latent=True,
+        do_latent_attention=False,
+        ip_tokens=None,
+        latent_attn_masks=None,
+        do_infer=False,
     ):
         for i, (resnet, attn, motion_module) in enumerate(
             zip(self.resnets, self.attentions, self.motion_modules)
@@ -727,6 +802,13 @@ class CrossAttnUpBlock3D(nn.Module):
                 hidden_states = attn(
                     hidden_states,
                     encoder_hidden_states=encoder_hidden_states,
+                    cross_attention_kwargs=cross_attention_kwargs,
+                    ref_idx=ref_idx,
+                    write_latent=write_latent,
+                    do_latent_attention=do_latent_attention,
+                    ip_tokens=ip_tokens,
+                    latent_attn_masks=latent_attn_masks,
+                    do_infer=do_infer,                    
                 ).sample
 
                 # add motion module

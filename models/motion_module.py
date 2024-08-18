@@ -143,7 +143,7 @@ class TemporalTransformer3DModel(nn.Module):
         )
         self.proj_out = nn.Linear(inner_dim, in_channels)
 
-    def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None):
+    def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, ref_idx=None):
         assert (
             hidden_states.dim() == 5
         ), f"Expected hidden_states to have ndim=5, but got ndim={hidden_states.dim()}."
@@ -166,6 +166,7 @@ class TemporalTransformer3DModel(nn.Module):
                 hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
                 video_length=video_length,
+                ref_idx=ref_idx,
             )
 
         # output
@@ -239,6 +240,7 @@ class TemporalTransformerBlock(nn.Module):
         encoder_hidden_states=None,
         attention_mask=None,
         video_length=None,
+        ref_idx=None,
     ):
         for attention_block, norm in zip(self.attention_blocks, self.norms):
             norm_hidden_states = norm(hidden_states)
@@ -358,6 +360,12 @@ class VersatileAttention(Attention):
         video_length=None,
         **cross_attention_kwargs,
     ):
+        # print(hidden_states.shape, '==========333==========')
+        # if encoder_hidden_states is not None:
+        #     print(hidden_states.shape, encoder_hidden_states.shape, '=========44==========')
+        # else:
+        #     print('encoder_hidden_states.shape  is none')
+            
         if self.attention_mode == "Temporal":
             d = hidden_states.shape[1]  # d means HxW
             hidden_states = rearrange(

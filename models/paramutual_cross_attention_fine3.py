@@ -3,10 +3,15 @@ from typing import Any, Dict, Optional
 
 import torch
 from einops import rearrange
+import numpy as np
 
 from models.attention import TemporalBasicTransformerBlock
 
 from .attention import BasicTransformerBlock
+import torch.nn.functional as F
+import math
+
+
 
 
 def torch_dfs(model: torch.nn.Module):
@@ -101,7 +106,7 @@ class ReferenceAttentionControl:
             class_labels: Optional[torch.LongTensor] = None,
             video_length=None,
             ref_idx=None,
-            write_latent=False,
+            write_latent=True,
             do_latent_attention=False,
             ip_tokens=None,
             latent_attn_masks=None,
@@ -151,16 +156,40 @@ class ReferenceAttentionControl:
                         **cross_attention_kwargs,
                     )
                 if MODE == "read":
+                    # bank_fea = [
+                    #     if d.shape[0] == 1:
+                    #         rearrange(
+                    #             d.unsqueeze(1).repeat(1, video_length, 1, 1),
+                    #             "b t l c -> (b t) l c",
+                    #         )
+                    #     else:
+                    #         d
+                    #     # rearrange(
+                    #     #     d.unsqueeze(1).repeat(1, video_length, 1, 1),
+                    #     #     "b t l c -> (b t) l c",
+                    #     # )
+                    #     for d in self.bank
+                    # ]
                     bank_fea = [
                         rearrange(
                             d.unsqueeze(1).repeat(1, video_length, 1, 1),
                             "b t l c -> (b t) l c",
-                        )
-                        for d in self.bank
+                        ) if d.shape[0] != norm_hidden_states.shape[0] else d for d in self.bank
                     ]
-                    modify_norm_hidden_states = torch.cat(
-                        [norm_hidden_states] + bank_fea, dim=1
-                    )
+                    # print("0000011111")
+                    # print(norm_hidden_states.shape)
+                    # for x in self.bank:
+                    #     print(x.shape)
+                    if not ref_idx:
+                        modify_norm_hidden_states = torch.cat(
+                            [norm_hidden_states] + bank_fea, dim=1
+                        )
+                    else:
+                        modify_norm_hidden_states = torch.cat(
+                            [norm_hidden_states] + [bank_fea[i] for i in ref_idx], dim=1
+                        )
+                    
+                    
                     hidden_states_uc = (
                         self.attn1(
                             norm_hidden_states,
@@ -169,6 +198,7 @@ class ReferenceAttentionControl:
                         )
                         + hidden_states
                     )
+                          
                     if do_classifier_free_guidance:
                         hidden_states_c = hidden_states_uc.clone()
                         _uc_mask = uc_mask.clone()
@@ -192,8 +222,10 @@ class ReferenceAttentionControl:
                         hidden_states = hidden_states_c.clone()
                     else:
                         hidden_states = hidden_states_uc
-
-                    # self.bank.clear()
+                        
+                    # if do_latent_attention:
+                    #     hidden_states = hidden_states + latent_hidden_states
+                                                        
                     if self.attn2 is not None:
                         # Cross-Attention
                         norm_hidden_states = (
@@ -201,6 +233,15 @@ class ReferenceAttentionControl:
                             if self.use_ada_layer_norm
                             else self.norm2(hidden_states)
                         )
+                        # print("45456777777")
+                        # print(norm_hidden_states.shape)
+                        # print(encoder_hidden_states.shape)
+                        # print("1234555555")
+                        # print(ip_tokens)
+                        # torch.Size([8, 1024, 320])
+                        # torch.Size([8, 4, 768])
+                        # print("77777777")
+                        # print(encoder_hidden_states.shape)
                         hidden_states = (
                             self.attn2(
                                 norm_hidden_states,
@@ -210,6 +251,21 @@ class ReferenceAttentionControl:
                             )
                             + hidden_states
                         )
+
+                        if do_latent_attention:
+                            print(ip_tokens.shape)
+                            # torch.Size([4, 1028, 768])
+
+                            latent_cross_hidden_states = (
+                                self.attn_cross_latent[0](
+                                    norm_hidden_states,
+                                    encoder_hidden_states=ip_tokens,
+                                    attention_mask=attention_mask,
+                                ) + hidden_states
+                            )
+                        if do_latent_attention:
+                            hidden_states = hidden_states + latent_cross_hidden_states
+
 
                     # Feed-forward
                     hidden_states = self.ff(self.norm3(hidden_states)) + hidden_states
@@ -244,6 +300,9 @@ class ReferenceAttentionControl:
                     if self.use_ada_layer_norm
                     else self.norm2(hidden_states)
                 )
+                # print("000999888777")
+                # print(norm_hidden_states.shape)
+                # print(encoder_hidden_states.shape)
 
                 # 2. Cross-Attention
                 attn_output = self.attn2(
@@ -253,7 +312,7 @@ class ReferenceAttentionControl:
                     **cross_attention_kwargs,
                 )
                 hidden_states = attn_output + hidden_states
-
+                
             # 3. Feed-forward
             norm_hidden_states = self.norm3(hidden_states)
 
@@ -305,7 +364,8 @@ class ReferenceAttentionControl:
 
                 module.bank = []
                 module.attn_weight = float(i) / float(len(attn_modules))
-
+                module.latent_bank = []
+                
     def update(self, writer, dtype=torch.float16):
         if self.reference_attn:
             if self.fusion_blocks == "midup":
@@ -343,7 +403,7 @@ class ReferenceAttentionControl:
             )
             for r, w in zip(reader_attn_modules, writer_attn_modules):
                 r.bank = [v.clone().to(dtype) for v in w.bank]
-                # r.bank.append([v.clone().to(dtype) for v in w.bank])
+                # r.bank.append([v.clone().to(dtype) for v in bank])
                 # w.bank.clear()
 
     def clear(self):

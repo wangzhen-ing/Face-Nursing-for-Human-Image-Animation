@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Callable, List, Optional, Union
 
 import numpy as np
+import cv2
 import torch
 from diffusers import DiffusionPipeline
 from diffusers.image_processor import VaeImageProcessor
@@ -14,20 +15,28 @@ from diffusers.schedulers import (
     LMSDiscreteScheduler,
     PNDMScheduler,
 )
+from diffusers.image_processor import IPAdapterMaskProcessor
 from diffusers.utils import BaseOutput, is_accelerate_available
 from diffusers.utils.torch_utils import randn_tensor
 from einops import rearrange
 from tqdm import tqdm
 from transformers import CLIPImageProcessor
+# from models.multimutual_self_attention import ReferenceAttentionControl
+from models.paramutual_cross_attention_fine import ReferenceAttentionControl
+from insightface.utils import face_align
+from PIL import Image
+import torchvision.transforms as transforms
 
-from models.mutual_self_attention import ReferenceAttentionControl
+#NOTE(wz) pipeline for final image,生成reference image as reference image
+
 
 
 @dataclass
 class MultiGuidance2ImagePipelineOutput(BaseOutput):
-    images: Union[torch.Tensor, np.ndarray]
+    videos: Union[torch.Tensor, np.ndarray]
 
-class MultiGuidance2ImagePipeline(DiffusionPipeline):
+
+class MultiGuidanceIPFine2ImagePipeline_train(DiffusionPipeline):
     _optional_components = []
 
     def __init__(
@@ -36,10 +45,14 @@ class MultiGuidance2ImagePipeline(DiffusionPipeline):
         image_encoder,
         reference_unet,
         denoising_unet,
-        # guidance_encoder_depth,
-        # guidance_encoder_normal,
-        # guidance_encoder_semantic_map,
+        guidance_encoder_depth,
+        guidance_encoder_normal,
+        guidance_encoder_semantic_map,
         guidance_encoder_DWpose,
+        image_encoder_ip,
+        image_proj_model,
+        # image_proj_model_fine,
+        # fusion_module,
         scheduler: Union[
             DDIMScheduler,
             PNDMScheduler,
@@ -56,10 +69,14 @@ class MultiGuidance2ImagePipeline(DiffusionPipeline):
             image_encoder=image_encoder,
             reference_unet=reference_unet,
             denoising_unet=denoising_unet,
-            # guidance_encoder_depth=guidance_encoder_depth,
-            # guidance_encoder_normal=guidance_encoder_normal,            
-            # guidance_encoder_semantic_map=guidance_encoder_semantic_map,
+            guidance_encoder_depth=guidance_encoder_depth,
+            guidance_encoder_normal=guidance_encoder_normal,            
+            guidance_encoder_semantic_map=guidance_encoder_semantic_map,
             guidance_encoder_DWpose=guidance_encoder_DWpose,
+            image_encoder_ip=image_encoder_ip,
+            image_proj_model=image_proj_model,
+            # image_proj_model_fine=image_proj_model_fine, 
+            # fusion_module=fusion_module,
             scheduler=scheduler,
         )
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
@@ -67,6 +84,7 @@ class MultiGuidance2ImagePipeline(DiffusionPipeline):
         self.ref_image_processor = VaeImageProcessor(
             vae_scale_factor=self.vae_scale_factor, do_convert_rgb=True
         )
+        self.ipadapter_mask_processor = IPAdapterMaskProcessor()
 
     def enable_vae_slicing(self):
         self.vae.enable_slicing()
@@ -141,6 +159,7 @@ class MultiGuidance2ImagePipeline(DiffusionPipeline):
         num_channels_latents,
         width,
         height,
+        video_length,
         dtype,
         device,
         generator,
@@ -149,6 +168,7 @@ class MultiGuidance2ImagePipeline(DiffusionPipeline):
         shape = (
             batch_size,
             num_channels_latents,
+            video_length,
             height // self.vae_scale_factor,
             width // self.vae_scale_factor,
         )
@@ -174,15 +194,24 @@ class MultiGuidance2ImagePipeline(DiffusionPipeline):
         self,
         ref_image,
         multi_guidance_lst,
+        face_multi_guidance_lst,
         guidance_types,
+        face_guidance_types,
+        region_image,
+        face_mask,
+        ref_img_path,
+        face_app,
         width,
         height,
+        video_length,
+        face_image_size,
         num_inference_steps,
         guidance_scale,
         num_images_per_prompt=1,
         eta: float = 0.0,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         output_type: Optional[str] = "tensor",
+        weight_dtype=torch.float32,
         return_dict: bool = True,
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: Optional[int] = 1,
@@ -210,12 +239,49 @@ class MultiGuidance2ImagePipeline(DiffusionPipeline):
             clip_image.to(device, dtype=self.image_encoder.dtype)
         ).image_embeds
         image_prompt_embeds = clip_image_embeds.unsqueeze(1)
-        uncond_image_prompt_embeds = torch.zeros_like(image_prompt_embeds)
+        uncond_image_prompt_embeds = self.image_encoder(
+            torch.zeros_like(clip_image).to(device, dtype=self.image_encoder.dtype)
+        ).image_embeds
+        uncond_image_prompt_embeds = uncond_image_prompt_embeds.unsqueeze(1)
+        # uncond_image_prompt_embeds = torch.zeros_like(image_prompt_embeds)
+        
+        # Prepare region image embeds        
+        # region_mask = self.ipadapter_mask_processor.preprocess(
+        #     region_mask.resize((width, height))
+        # ).to(device, dtype=self.image_encoder_ip.dtype)
 
+        id_image = cv2.imread(ref_img_path)
+        faces = face_app.get(id_image)
+        id_embeds = torch.from_numpy(faces[0].normed_embedding).unsqueeze(0).to(device, dtype=self.image_encoder_ip.dtype)
+        uncond_id_embeds = torch.zeros_like(id_embeds).to(device, dtype=self.image_encoder_ip.dtype)
+
+        face_image = face_align.norm_crop(id_image, landmark=faces[0].kps, image_size=224)
+        region_clip_image = self.clip_image_processor.preprocess(
+            images=face_image, return_tensors="pt"
+        ).pixel_values
+        region_image_embeds = self.image_encoder_ip(
+            region_clip_image.to(device, dtype=self.image_encoder_ip.dtype),
+            output_hidden_states=True,
+        ).hidden_states[-2]
+        uncond_region_image_embeds = self.image_encoder_ip(
+            torch.zeros_like(region_clip_image).to(device, dtype=self.image_encoder_ip.dtype),
+            output_hidden_states=True,
+        ).hidden_states[-2]
+        
         if do_classifier_free_guidance:
             image_prompt_embeds = torch.cat(
                 [uncond_image_prompt_embeds, image_prompt_embeds], dim=0
             )
+            region_image_embeds = torch.cat(
+                [uncond_region_image_embeds, region_image_embeds], dim=0
+            )
+            # region_mask = torch.cat(
+            #     [region_mask, region_mask], dim=0
+            # )
+            id_embeds = torch.stack(
+                [uncond_id_embeds, id_embeds], dim=0
+            )
+        ip_tokens = self.image_proj_model(id_embeds, region_image_embeds)
 
         reference_control_writer = ReferenceAttentionControl(
             self.reference_unet,
@@ -233,18 +299,19 @@ class MultiGuidance2ImagePipeline(DiffusionPipeline):
         )
 
         num_channels_latents = self.denoising_unet.in_channels
-        latents = self.prepare_latents(
+
+        latents2 = self.prepare_latents(
             batch_size * num_images_per_prompt,
             num_channels_latents,
             width,
             height,
+            video_length,
             clip_image_embeds.dtype,
             device,
             generator,
         )
-        latents = latents.unsqueeze(2)  # (bs, c, 1, h', w')
-        latents_dtype = latents.dtype
-
+        # latents2 = latents2.unsqueeze(2) 
+        
         # Prepare extra step kwargs.
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
@@ -258,19 +325,38 @@ class MultiGuidance2ImagePipeline(DiffusionPipeline):
         ref_image_latents = self.vae.encode(ref_image_tensor).latent_dist.mean
         ref_image_latents = ref_image_latents * 0.18215  # (b, 4, h, w)
 
+        region_image_tensor = self.ref_image_processor.preprocess(
+            Image.fromarray(face_image[..., ::-1]), height=height, width=width,
+        )
+        region_image_tensor = region_image_tensor.to(
+            dtype=self.vae.dtype, device=self.vae.device
+        )
+        region_image_latents = self.vae.encode(region_image_tensor).latent_dist.mean
+        region_image_latents = region_image_latents * 0.18215
+
+
         guidance_fea_lst = []
-        for guid_idx, guidance_image in enumerate(multi_guidance_lst):
-            guidance_tensor = torch.from_numpy(np.array(guidance_image.resize((width, height)))) / 255.
-            guidance_tensor = guidance_tensor.permute(2, 0, 1).unsqueeze(0).unsqueeze(2)  # (1, c, 1, h, w)
+        for guid_idx, guidance_image_lst in enumerate(multi_guidance_lst):
+            guidance_tensor_lst = [torch.from_numpy(np.array(guidance_image.resize((width, height)))) / 255. for guidance_image in guidance_image_lst]
+            guidance_tensor = torch.stack(guidance_tensor_lst, dim=0).permute(3, 0, 1, 2) #(c, f, h, w)
+            guidance_tensor = guidance_tensor.unsqueeze(0)
             
             guidance_type = guidance_types[guid_idx]
             guidance_encoder = getattr(self, f"guidance_encoder_{guidance_type}")
-            guidance_tensor = guidance_tensor.to(device, guidance_encoder.dtype)
+            guidance_tensor = guidance_tensor.to(device=device, dtype=guidance_encoder.dtype)
             guidance_fea_lst += [guidance_encoder(guidance_tensor)]
             
         guidance_fea = torch.stack(guidance_fea_lst, dim=0).sum(0)
         guidance_fea = torch.cat([guidance_fea] * 2) if do_classifier_free_guidance else guidance_fea
+            
+        guidance_fea = torch.stack(guidance_fea_lst, dim=0).sum(0)
+        guidance_fea = torch.cat([guidance_fea] * 2) if do_classifier_free_guidance else guidance_fea
+
         
+        face_mask = transforms.ToTensor()(face_mask).to(device=device, dtype=self.vae.dtype)
+        # face_mask = torch.stack([face_mask * 2]) if do_classifier_free_guidance else face_mask
+        latent_attn_masks = torch.stack([face_mask], dim=1)
+
         # denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         with self.progress_bar(total=num_inference_steps) as progress_bar:
@@ -285,26 +371,32 @@ class MultiGuidance2ImagePipeline(DiffusionPipeline):
                         encoder_hidden_states=image_prompt_embeds,
                         return_dict=False,
                     )
-
                     # 2. Update reference unet feature into denosing net
                     reference_control_reader.update(reference_control_writer)
 
                 # 3.1 expand the latents if we are doing classifier free guidance
                 latent_model_input = (
-                    torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                    torch.cat([latents2] * 2) if do_classifier_free_guidance else latents2
                 )
                 latent_model_input = self.scheduler.scale_model_input(
                     latent_model_input, t
                 )
 
-                noise_pred = self.denoising_unet(
+                noise_pred, model_latents_pred = self.denoising_unet(
                     latent_model_input,
                     t,
                     encoder_hidden_states=image_prompt_embeds,
                     guidance_fea=guidance_fea,
                     return_dict=False,
-                    ref_idx=None,
-                )[0]
+                    ref_idx=(0,),
+                    # cross_attention_kwargs={"ip_adapter_masks": region_mask}
+                    additional_upsample=False,
+                    write_latent=False,
+                    do_latent_attention=True,
+                    ip_tokens=ip_tokens,
+                    latent_attn_masks=latent_attn_masks,
+                    do_infer=True,
+                )
 
                 # perform guidance
                 if do_classifier_free_guidance:
@@ -312,11 +404,10 @@ class MultiGuidance2ImagePipeline(DiffusionPipeline):
                     noise_pred = noise_pred_uncond + guidance_scale * (
                         noise_pred_text - noise_pred_uncond
                     )
-
                 # compute the previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(
-                    noise_pred, t, latents, **extra_step_kwargs, return_dict=False
-                )[0]
+                latents2 = self.scheduler.step(
+                    noise_pred, t, latents2, **extra_step_kwargs, return_dict=False
+                )[0]                
 
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or (
@@ -325,18 +416,22 @@ class MultiGuidance2ImagePipeline(DiffusionPipeline):
                     progress_bar.update()
                     if callback is not None and i % callback_steps == 0:
                         step_idx = i // getattr(self.scheduler, "order", 1)
-                        callback(step_idx, t, latents)
+                        callback(step_idx, t, latents2)
             reference_control_reader.clear()
             reference_control_writer.clear()
-
-        # Post-processing
-        image = self.decode_latents(latents)  # (b, c, 1, h, w)
+        # print(latents2.shape)
+        target_image = self.decode_latents(latents2)  # (b, c, f, h, w)
 
         # Convert to tensor
         if output_type == "tensor":
-            image = torch.from_numpy(image)
+            target_image = torch.from_numpy(target_image)
+            # print("-----dddddd")
+            # print(target_image.shape)
+            # face_image = torch.from_numpy(face_image)
+            # upsampled_image = torch.from_numpy(upsampled_image)
 
         if not return_dict:
-            return image
+            return target_image#, upsampled_image)
 
-        return MultiGuidance2ImagePipelineOutput(images=image)
+        return MultiGuidance2ImagePipelineOutput(videos=target_image)
+

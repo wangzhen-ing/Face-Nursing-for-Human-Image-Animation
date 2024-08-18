@@ -20,7 +20,7 @@ from diffusers.models.embeddings import (
     ImageHintTimeEmbedding,
     ImageProjection,
     ImageTimeEmbedding,
-    PositionNet,
+    # PositionNet,
     TextImageProjection,
     TextImageTimeEmbedding,
     TextTimeEmbedding,

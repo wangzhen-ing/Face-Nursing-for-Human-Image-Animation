@@ -1,0 +1,106 @@
+output_dir: "exp_output/inference_v2_tiktolk_56683_lowipadapter*0.3"
+seed: 42
+resume_from_checkpoint: ''
+# fece motion operate by Gaussian filter, face latent operate both in spatial attention and cross attention without mask
+stage15_ckpt_step: 56883
+stage15_ckpt_dir: '/cpfs01/projects-HDD/cfff-6f3a36a0cd1e_HDD/zsy_43187/champ/workspaces/cuijh/champ-train-dev/exp_output/stage1.5_face_fine_v2/saved_models'  # stage1 checkpoint folder
+ref_idx:
+  - 5
+  - 11
+  - 4
+  - 30
+  - 3
+  - 0
+  - 27
+  - 0
+  - 12
+  - 5 
+  # - 16
+  # - 15
+  # - 0
+  # - 0
+  # - 182
+  # - 0
+  # - 0
+  # - 0
+  # - 0
+  # - 24 
+  # - 0
+
+
+
+
+
+num_inference_steps: 20
+guidance_scale: 3.5
+ref_data_root: ""
+data_root: "/cpfs01/projects-HDD/cfff-6f3a36a0cd1e_HDD/zsy_43187/champ/datasets/archived/Processed_Local_new"
+data_part: "Vanilla_Tiktok_val_w_leg"
+guidance_types:
+  - "DWpose"
+
+data:
+  guids: 
+    - 'DWpose'
+  image_size: 1024
+  # bbox_crop: false
+  # bbox_resize_ratio: [0.9, 1.5]
+  # aug_type: "Resize"
+  # data_parts:
+  #   - "all"
+  # sample_margin: 30
+  # select_face: true
+  face_folder: "/cpfs01/projects-HDD/cfff-6f3a36a0cd1e_HDD/zsy_43187/champ/workspaces/cyx/face_landmark/temp_with_face_mask"
+  face_image_size: 256
+  face_guids:
+    - "lmk_images"
+
+validation:
+  validation_steps: 250
+  aug_type: "Padding"
+           
+solver:
+  gradient_accumulation_steps: 1
+  mixed_precision: 'fp16'
+  enable_xformers_memory_efficient_attention: True 
+  gradient_checkpointing: False 
+  max_train_steps: 60000  # 50000
+  max_grad_norm: 1.0
+  # lr
+  learning_rate: 1.0e-5
+  scale_lr: False 
+  lr_warmup_steps: 1
+  lr_scheduler: 'constant'
+
+  # optimizer
+  use_8bit_adam: False 
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_weight_decay:  1.0e-2
+  adam_epsilon: 1.0e-8
+
+noise_scheduler_kwargs:
+  num_train_timesteps: 1000
+  beta_start:          0.00085
+  beta_end:            0.012
+  beta_schedule:       "scaled_linear"
+  steps_offset:        1
+  clip_sample:         false
+
+guidance_encoder_kwargs:
+  guidance_embedding_channels: 320
+  guidance_input_channels: 3
+  block_out_channels: [16, 32, 96, 256]
+
+base_model_path: 'pretrained_models/stable-diffusion-v1-5'
+vae_model_path: 'pretrained_models/sd-vae-ft-mse'
+image_encoder_path: 'pretrained_models/image_encoder'
+ipadapter_path: "pretrained_models/ip-adapter-faceid-plusv2_sd15.bin"
+image_encoder_ip_path: "pretrained_models/laion_clip"
+
+weight_dtype: 'fp16'  # [fp16, fp32]
+uncond_ratio: 0.1
+noise_offset: 0.05
+snr_gamma: 5.0
+enable_zero_snr: True 
+ 
