@@ -4,24 +4,19 @@
 
 The effect of face nursing on the Tiktolk dataset
 
-![截屏2024-09-19 20.41.08](/Users/wangzhen/Documents/daily_record/graduate_life/note/实验记录/README.assets/截屏2024-09-19 20.41.08.png)
-
-![截屏2024-09-19 20.41.41](/Users/wangzhen/Documents/daily_record/graduate_life/note/实验记录/README.assets/截屏2024-09-19 20.41.41.png)
-
-![截屏2024-09-19 20.42.47](/Users/wangzhen/Documents/daily_record/graduate_life/note/实验记录/README.assets/截屏2024-09-19 20.42.47.png)
-
-![截屏2024-09-19 20.42.58](/Users/wangzhen/Documents/daily_record/graduate_life/note/实验记录/README.assets/截屏2024-09-19 20.42.58.png)
+![effect1](assets/comp1.png)
+![effect2](assets/comp2.png)
+![effect3](assets/comp3.png)
+![effect4](assets/comp4.png)
 
 ## Overall Framework
 
 This work is an extension of [champ](https://github.com/fudan-generative-vision/champ). 
 
-![截屏2024-09-19 20.44.56](/Users/wangzhen/Documents/daily_record/graduate_life/note/实验记录/README.assets/截屏2024-09-19 20.44.56.png)
-
+![Framework](assets/OverallFramework.png)
 ## Detail of Face Nursing
 
-![截屏2024-09-19 20.44.16](/Users/wangzhen/Documents/daily_record/graduate_life/note/实验记录/README.assets/截屏2024-09-19 20.44.16.png)
-
+![Framework](assets/FaceNursing.png)
 ## Installation
 
 - System requirement: Ubuntu20.04/Windows 11, Cuda 12.1
