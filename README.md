@@ -1,4 +1,4 @@
-# Face Nursing for Human Image Animation 
+# Face Nursing for Controllable and Consistent Human Image Animation 
 
 ## Effect
 
